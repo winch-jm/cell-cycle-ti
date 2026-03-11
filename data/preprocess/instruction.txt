@@ -1,0 +1,22 @@
+It's important to work with preprocessed data for this graph construction 
+(log1p -> selected highly variable genes -> 20-50 PCA top components)
+log1p:
+-Raw data is in UMI counts-short random DNA sequences added to DNA before PCR
+
+highly variable genes:
+-most genes are housekeeping genes and expressed at the same level in every cell
+-HVG kept the 2000 most variable genes across
+
+PCA:
+-we have data from 1029 cells with 2000 different gene counts, PCA compresses this
+to 20-50 genes per cell by finding the main axes of variation
+
+end result: 1029 x 50 matrix
+
+- using GSE142277_RAW
+- use parsed GSE142277_RAW data 
+- /Users/anoushkasamuel/go/src/cell-cycle-ti/notebooks/ParseGEOData.ipynb = wt_data
+
+
+with the preprocessed data, in order to create the trajectory graph use "adata.obsm['X_pca']" 
+use [:, :20] - [:, :50] columns depending on how many PCs 
