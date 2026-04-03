@@ -4,7 +4,7 @@ import scanpy as sc
 
 # Load raw data
 wt_data = pd.read_csv(
-    '/Users/anoushkasamuel/go/src/cell-cycle-ti/data/GSE142277/GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt',
+    '/Users/anoushkasamuel/VSCode/src/cell-cycle-ti/data/GSE142277/GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt',
     sep='\t',
     index_col=0
 )
@@ -24,3 +24,4 @@ sc.tl.pca(adata, n_comps=50)
 
 print(adata)
 print("PCA shape:", adata.obsm['X_pca'].shape)
+adata.write_h5ad("/Users/anoushkasamuel/VSCode/src/cell-cycle-ti/data/wt_data.h5ad")
