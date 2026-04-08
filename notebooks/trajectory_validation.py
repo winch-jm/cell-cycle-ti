@@ -9,12 +9,14 @@ Validation axes:
 2. Phase transition order verification (G1 → S → G2/M)
 3. Robustness to subsampling and stability across kNN k values
 """
-
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 from scipy import stats
 import scanpy as sc
 
-from trajectory_inference.Laplacian_Eigenmaps import loadAndCSR, laplacianEigenmaps, pseudotime as compute_pseudotime
+from trajectory_inference.Laplacian_Eigenmaps import loadAndCSR, laplacianEigenmaps, pseudotime
 
 
 # ── Gene lists (Tirosh et al., 2016) ─────────────────────────────────────
@@ -51,7 +53,7 @@ def _full_pipeline(adata, k):
     """
     csr = loadAndCSR(adata, k)
     embedding, eigvals = laplacianEigenmaps(csr)
-    pt = compute_pseudotime(embedding)
+    pt = pseudotime(embedding)
     return pt, eigvals
 
 
@@ -290,3 +292,11 @@ def run_all(adata, pseudotime_values, k=15, subsample_trials=10, k_values=None):
         "k_pseudotimes": pt_dict,
         "k_correlation_matrix": k_corr,
     }
+
+
+if __name__ == "__main__":
+    from data.preprocess.preprocess import adata
+
+    k = 15
+    pt, _ = _full_pipeline(adata, k)
+    run_all(adata, pt, k=k)
