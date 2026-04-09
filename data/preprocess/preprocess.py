@@ -26,3 +26,4 @@ sc.tl.pca(adata, n_comps=50)
 
 print(adata)
 print("PCA shape:", adata.obsm['X_pca'].shape)
+adata.write_h5ad("/Users/anoushkasamuel/VSCode/src/cell-cycle-ti/data/wt_data.h5ad")

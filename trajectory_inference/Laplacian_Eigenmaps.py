@@ -4,8 +4,10 @@
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
+import anndata as ad
 
-# importing processed data and functions for kNN
+# importing functions for kNN
+
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -51,8 +53,11 @@ def laplacianEigenmaps(CSR, nComponents = 2):
     L = D - CSR
 
     # solution to eigenproblem Lv = lamda(Dv)
+    # setting a random, seeded v0 for eigsh
+    rng = np.random.default_rng(50)
+    v0 = rng.random(L.shape[0])
     # requesting "SM" for smallest eigvas/vecs and k = 3 to get smallest 2 non-trivial outputs (smallest eigval will be trivial = 0)
-    eigvals, eigvecs = eigsh(L, k = nComponents + 1, M = D, which = "SM", tol = 1e-6)
+    eigvals, eigvecs = eigsh(L, k = nComponents + 1, M = D, which = "SM", tol = 1e-6, v0=v0)
 
     # sorting eigenvalues in ascending order
     ordered = np.argsort(eigvals)
