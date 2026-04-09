@@ -1,10 +1,12 @@
+import os
 import pandas as pd
 import anndata as ad
 import scanpy as sc
 
 # Load raw data
-wt_data = pd.read_csv(
-    '/Users/anoushkasamuel/go/src/cell-cycle-ti/data/GSE142277/GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt',
+_data_path = os.path.join(os.path.dirname(__file__), '..', 'GSE142277',
+                          'GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt')
+wt_data = pd.read_csv(_data_path,
     sep='\t',
     index_col=0
 )

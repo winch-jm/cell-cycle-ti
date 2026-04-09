@@ -7,9 +7,9 @@ from scipy.sparse.linalg import eigsh
 
 # importing processed data and functions for kNN
 import sys
-sys.path.append('/Users/sophia/Desktop/Fundamentals_of_Bioinformatics/BioInfoFinalProject')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from data_structure.weighted_knn import  DenseRows, weighted_knn
-from data.preprocess.preprocess import adata
 
 def loadAndCSR(adata, k):
 
@@ -72,15 +72,18 @@ def pseudotime(embedding):
 
     return pseudo
 
-csr = loadAndCSR(adata, 15)
-embedding, eigvals = laplacianEigenmaps(csr)
-pseudotimeCord = pseudotime(embedding)
+if __name__ == "__main__":
+    from data.preprocess.preprocess import adata
 
-### sanity checks
+    csr = loadAndCSR(adata, 15)
+    embedding, eigvals = laplacianEigenmaps(csr)
+    pseudotimeCord = pseudotime(embedding)
 
-# should be (1029 - samples, 2 - embeddings)
-print("Embedding shape", embedding.shape)
-# should be from -pi to pi
-print("Pseudotime range", pseudotimeCord.min(), pseudotimeCord.max())
-# should be small pos nums
-print("Eigenvalues:", eigvals)
+    ### sanity checks
+
+    # should be (1029 - samples, 2 - embeddings)
+    print("Embedding shape", embedding.shape)
+    # should be from -pi to pi
+    print("Pseudotime range", pseudotimeCord.min(), pseudotimeCord.max())
+    # should be small pos nums
+    print("Eigenvalues:", eigvals)
