@@ -17,6 +17,9 @@ adata = ad.AnnData(X=wt_data.T.astype(float))
 # log1p
 sc.pp.log1p(adata)
 
+# Preserve full log-normalized matrix for downstream cell cycle scoring
+adata.raw = adata
+
 # Highly variable genes
 sc.pp.highly_variable_genes(adata, n_top_genes=2000)
 adata = adata[:, adata.var.highly_variable].copy()
@@ -26,4 +29,4 @@ sc.tl.pca(adata, n_comps=50)
 
 print(adata)
 print("PCA shape:", adata.obsm['X_pca'].shape)
-adata.write_h5ad("/Users/anoushkasamuel/VSCode/src/cell-cycle-ti/data/wt_data.h5ad")
+adata.write_h5ad(os.path.join(os.path.dirname(__file__), '..', 'wt_data.h5ad'))
