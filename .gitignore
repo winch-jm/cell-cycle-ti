@@ -209,3 +209,6 @@ __marimo__/
 
 # RAW DATA
 GSE142277_RAW/
+
+data/wt_data.h5ad
+*.h5ad
