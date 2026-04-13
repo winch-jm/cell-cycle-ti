@@ -2,9 +2,13 @@
 # goal -- cells that are in similar phase of cell cycle will be closer in 2d embedding
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 import anndata as ad
+import scanpy as sc
+import warnings
+warnings.filterwarnings("ignore", category = UserWarning, module = "openpyxl")
 
 # importing functions for kNN
 
@@ -14,6 +18,11 @@ from data_structure.weighted_knn import DenseRows, weighted_knn
 
 # loading in processed dataset
 adata = ad.read_h5ad("../data/wt_data.h5ad")
+
+# loading in phase marker data sets
+geneData = pd.ExcelFile("../data/GSE142277/gene_sets_GSE142277.xlsx")
+phaseList = ["G1/S", "S", "G2/M", "M", "M/G1"]
+geneSets = geneData.parse("Gene Sets Used in Analysis")
 
 def loadAndCSR(adata, k):
 
@@ -72,22 +81,105 @@ def laplacianEigenmaps(CSR, nComponents = 2):
 
     return embedding, eigvals
 
-def pseudotime(embedding):
+def scoreCells(adata, geneSet = geneSets, phases = phaseList):
+
+    """Input parameters:
+        AnnData object from preprocesing
+        marker gene set data from study's excel file
+        list of phases in gene set data
+
+        Scores each cell based on gene expression of each phase marker gene set and assigns
+        highest scoring phase as cell cycle phase for each cell
+
+        Output:
+        AnnData object with columns for score of each phase and final phase assignment for each cell"""
+
+    # looping through each phase to score each cell against phase marker gene set
+    for phase in phases:
+        genes = geneSet[phase].dropna().str.strip().tolist()
+        # filtering to genes existing in dataset
+        genesPresent = [g for g in genes if g in adata.var_names]
+        # scanpy's gene scoring function - computes score of every cell for each phase and saves into new phase col in adata
+        sc.tl.score_genes(adata, gene_list=genesPresent, score_name=f"score_{phase}")
+
+    # list of phase col headers
+    scoreCols = [f"score_{phase}" for phase in phases]
+    # getting highest scored phase for each cell(phase assignment per cell) and ordering based on biological ordering of phases
+    adata.obs["phase"] = pd.Categorical(adata.obs[scoreCols].idxmax(axis=1).str.replace("score_", "", regex=False), categories=phases, ordered=True)
+
+    return adata
+
+def findRootCell(adataWithPhase):
+
+    """Input parameters:
+    AnnData object from preprocesing and cell cycle phase scoring
+
+    Finds root cell by filtering out cell with highest G1/S score
+
+    Output:
+    root cell index in adata"""
+
+    # filtering out G1/S phase cells
+    g1Mask = adataWithPhase.obs["phase"] == "G1/S"
+    g1Scores = adataWithPhase.obs.loc[g1Mask, "score_G1/S"]
+    # root is cell with highest score for G1/S phase
+    rootIndex = int(g1Scores.argmax())
+    return rootIndex
+
+def pseudotime(embedding, rootIndex = None):
+
+    """Input parameters:
+    2D embedding
+
+    If root cell not indicated, converts linear coordinates of 2D embedding into
+    angular coordinates. If root cell index indicated, rotates circular manifold so root cell
+    is at pseudotime = 0 and other angles are relative to it
+
+    Output:
+    pseudotime
+    """
 
     # converts embedding from 2D coordinates to angular coordinates
     pseudo = np.arctan2(embedding[:, 1], embedding[:, 0])
+
+    if rootIndex is not None:
+        offset = pseudo[rootIndex]
+        pseudo = (pseudo - offset + np.pi) % (2 * np.pi) - np.pi
 
     return pseudo
 
 csr = loadAndCSR(adata, 15)
 embedding, eigvals = laplacianEigenmaps(csr)
-pseudotimeCord = pseudotime(embedding)
+scoredAdata = scoreCells(adata, geneSet = geneSets, phases = phaseList)
+rootCell = findRootCell(scoredAdata)
+ps = pseudotime(embedding, rootIndex = rootCell)
 
 ### sanity checks
 
 # should be (1029 - samples, 2 - embeddings)
 print("Embedding shape", embedding.shape)
 # should be from -pi to pi
-print("Pseudotime range", pseudotimeCord.min(), pseudotimeCord.max())
+print("Pseudotime range", ps.min(), ps.max())
 # should be small pos nums
 print("Eigenvalues:", eigvals)
+
+def fullLaplacian(adata, k):
+
+    """Input parameters:
+    AnnData object from preprocessing and k number of clusters for kNN
+
+    Constructs cell-cell similarity graph, computes graph Laplacian and extracts 2D
+    embedding. Scores cells based on gene expression profile for phase marker gene sets
+    and assigns cell with phase based on highest score. Finds root cell and calculates
+    pseudotime
+
+    Output:
+    embedding, eigvals, pseudo"""
+
+    csr = loadAndCSR(adata, k)
+    embedding, eigvals = laplacianEigenmaps(csr)
+    scoredAdata = scoreCells(adata, geneSet=geneSets, phases=phaseList)
+    rootCell = findRootCell(scoredAdata)
+    ps = pseudotime(embedding, rootIndex=rootCell)
+
+    return embedding, eigvals, ps
