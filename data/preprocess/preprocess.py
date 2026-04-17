@@ -3,10 +3,8 @@ import anndata as ad
 import scanpy as sc
 import numpy as np
 
-raw_data_filePath = "../GSE142277/GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt"
-gene_marker_csv_path = "../GSE142277/revelio_gene_sets.csv"
 
-def loadData(filepath = raw_data_filePath):
+def loadData(filepath):
     # loading in raw data
     wt_data = pd.read_csv(filepath, sep = "\t", index_col = 0)
     return wt_data
