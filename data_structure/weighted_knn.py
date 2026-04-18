@@ -39,10 +39,7 @@ def cosine(row_i, row_j):
 
 
 def weighted_knn(dr, k):
-    print("Running Weighted KNN:")
-    print("Creating Adjacency Matrix..")
     adjacency_matrix = similarities(dr, k)
-    print("Constructing Graph...")
     return graph_creation(adjacency_matrix, dr)
 
 
