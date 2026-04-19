@@ -10,12 +10,14 @@ import scanpy as sc
 from scipy.stats import zscore
 import warnings
 warnings.filterwarnings("ignore", category = UserWarning, module = "openpyxl")
+from scipy.stats import rankdata
 
 # importing functions for kNN
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from data_structure.weighted_knn import DenseRows, weighted_knn
+from data.preprocess.preprocess import revelio_like_preprocess, loadData, readMarkerSets
 
 ####### preprocessed data loading and kNN
 def loadAndCSR(adata, k):
@@ -39,7 +41,7 @@ def loadAndCSR(adata, k):
     return CSR
 
 #### laplacian computation
-def laplacianEigenmaps(CSR, nComponents = 2):
+def laplacianEigenmaps(CSR, nComponents = 10):
     """Input Parameters:
     CSR: compressed sparse row matrix of cell-cell similarity graph
     nComponents: number of embedding dimensions = 2 to get 2D embedding coordinates per cell required for circular pseudotime calculation
@@ -118,15 +120,32 @@ def laplacianPseudotime(embedding, eigvals, rootIndex=0, eps=1e-12):
     Output:
     pseudotime for each cell"""
 
-    denom = np.maximum(1.0 - eigvals, eps)
+    denom = np.maximum(eigvals, eps)
     diff = embedding - embedding[rootIndex, :]
     dpt_sq = np.sum((diff ** 2) / denom[None, :], axis=1)
     pseudo = np.sqrt(dpt_sq)
 
     return pseudo
 
+# rank cells by pseudotime before plotting
+def rankPseudo(adata, embedding, pseudo):
+    X = adata.obsm['X_pca']
+
+    # adding pseudotime to adata
+    adata.obs['lpt'] = pseudo
+    # ranking pseudotime
+    lpt_rank = (rankdata(pseudo) - 1) / (len(pseudo) - 1)
+    # adding in ranks of pseudotimes
+    adata.obs['lpt_rank'] = lpt_rank
+    # reordering cell cycle column into biological order
+    adata.obs['cc_phase'] = pd.Categorical(adata.obs['cc_phase'], categories=['G1.S', 'S', 'G2', 'G2.M', 'M.G1'],
+                                           ordered=True)
+
+
+    return adata
+
 #### integration of helper functions for full laplacian eigenmap method
-def fullLaplacian(adata, k):
+def fullLaplacian(adata, k, nComponents = 10):
 
     """Input parameters:
     AnnData object from revelio preprocessing and k number of clusters for kNN
@@ -138,7 +157,7 @@ def fullLaplacian(adata, k):
     embedding, eigvals, pseudo"""
 
     csr = loadAndCSR(adata, k)
-    embedding, eigvals = laplacianEigenmaps(csr)
+    embedding, eigvals = laplacianEigenmaps(csr, nComponents)
     rootIndex = findRootCell(adata, embedding)
     ps = laplacianPseudotime(embedding, eigvals, rootIndex=rootIndex, eps=1e-12)
 
@@ -146,7 +165,9 @@ def fullLaplacian(adata, k):
 
 ############### FULL LAPLACIAN IMPLEMENTATION
 
-#adata = revelio_like_preprocess(data, marker_dict)
+#countdf = loadData("../data/GSE142277/GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt")
+#marker_dict = readMarkerSets("../data/GSE142277/revelio_gene_sets.csv", format = "csv")
+#adata = revelio_like_preprocess(countdf, marker_dict)
 #embedding, eigvals, ps = fullLaplacian(adata, k = 10)
 
 ### sanity checks
