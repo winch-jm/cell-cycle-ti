@@ -744,9 +744,6 @@ if __name__ == "__main__":
 
     results = run_all(adata, embedding, data, marker_dict, k=k,
                       subsample_trials=10)
-
-    plot_subsample_robustness(results["subsample_correlations"],
-                              results["subsample_trial_data"])
     plot_aggregate_hexbin(results["subsample_trial_data"])
     plot_correlation_by_phase(results["subsample_trial_data"])
     plot_phase_order(adata, embedding,
