@@ -5,239 +5,435 @@ Validates inferred circular pseudotime from Laplacian Eigenmaps
 against known cell cycle biology.
 
 Validation axes:
-1. Correlation between pseudotime and cell cycle phase scores
-2. Phase transition order verification (G1 → S → G2/M)
+1. Correlation between pseudotime and cell cycle phase z-scores
+2. Phase transition order verification (G1/S → S → G2/M → M → M/G1)
 3. Robustness to subsampling and stability across kNN k values
+
+Phase scoring follows the Revelio-style double-z-score method used in
+DiffusionMapsDemo.ipynb, with the 5-phase marker sets loaded from the
+GSE142277 gene_sets spreadsheet.
 """
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
+import pandas as pd
 from scipy import stats
+import seaborn as sns
+import matplotlib.pyplot as plt
 import scanpy as sc
 
-from trajectory_inference.Laplacian_Eigenmaps import loadAndCSR, laplacianEigenmaps, pseudotime
+from statsmodels.nonparametric.smoothers_lowess import lowess as sm_lowess
+
+from trajectory_inference.Laplacian_Eigenmaps import fullLaplacian, revelio_like_preprocess
+from trajectory_inference.diffusion_maps import fullDiffusion
 
 
-# ── Gene lists (Tirosh et al., 2016) ─────────────────────────────────────
-# Includes both original and updated HGNC symbols for compatibility.
+# Canonical order of cell cycle phases around the circle (matches revelio_gene_sets.csv)
+PHASE_ORDER = ["G1/S", "S", "G2", "G2/M", "M/G1"]
 
-S_GENES = [
-    "MCM5", "PCNA", "TYMS", "FEN1", "MCM2", "MCM4", "RRM1", "UNG",
-    "GINS2", "MCM6", "CDCA7", "DTL", "PRIM1", "UHRF1", "CENPU",
-    "MLF1IP",  # old name for CENPU
-    "HELLS", "RFC2", "RPA2", "NASP", "RAD51AP1", "GMNN", "WDR76",
-    "SLBP", "CCNE2", "UBR7", "POLD3", "MSH2", "ATAD2", "RAD51",
-    "RRM2", "CDC45", "CDC6", "EXO1", "TIPIN", "DSCC1", "BLM",
-    "CASP8AP2", "USP1", "CLSPN", "POLA1", "CHAF1B", "BRIP1", "E2F8",
-]
+# Transcriptionally periodic validation genes across the full cell cycle.
+# Some overlap with Revelio marker lists, but validation tests single-gene
+# peak timing against pseudotime — a different signal from aggregate phase scores.
+VALIDATION_GENES = {
+    # G1
+    "CCND1":  "G1",
+    # G1/S
+    "E2F2":   "G1/S",
+    "CCNE2":  "G1/S",
+    "CDC6":   "G1/S",
+    "MCM5":   "G1/S",
+    # S
+    "PCNA":   "S",
+    "RRM2":   "S",
+    "PLK4":   "S",
+    "TYMS":   "S",
+    # S/G2
+    "CCNA2":  "S/G2",
+    # G2
+    "WEE1":   "G2",
+    "CCNF":   "G2",
+    # G2/M
+    "CCNB1":  "G2/M",
+    "CCNB2":  "G2/M",
+    "TOP2A":  "G2/M",
+    "NEK2":   "G2/M",
+    # M
+    "PLK1":   "M",
+    "AURKA":  "M",
+    "BUB1":   "M",
+    "UBE2C":  "M",
+    "CDC20":  "M",
+}
 
-G2M_GENES = [
-    "HMGB2", "CDK1", "NUSAP1", "UBE2C", "BIRC5", "TPX2", "TOP2A",
-    "NDC80", "CKS2", "NUF2", "CKS1B", "MKI67", "TMPO", "CENPF",
-    "TACC3", "FAM64A", "PIMREG",  # FAM64A renamed to PIMREG
-    "SMC4", "CCNB2", "CKAP2L", "CKAP2", "AURKB",
-    "BUB1", "KIF11", "ANP32E", "TUBB4B", "GTSE1", "KIF20B", "HJURP",
-    "CDCA3", "HN1", "JPT1",  # HN1 renamed to JPT1
-    "CDC20", "TTK", "CDC25C", "KIF2C", "RANGAP1",
-    "NCAPD2", "DLGAP5", "CDCA2", "CDCA8", "ECT2", "KIF23", "HMMR",
-    "AURKA", "PSRC1", "ANLN", "LBR", "CKAP5", "CENPE", "CTCF",
-    "NEK2", "G2E3", "GAS2L3", "CBX5", "CENPA",
-]
+# Numeric ordering of phases for expected-rank assignment
+VALIDATION_PHASE_ORDER = {
+    "G1": 1, "G1/S": 2, "S": 3, "S/G2": 4, "G2": 5, "G2/M": 6, "M": 7,
+}
+data = pd.read_csv("../data/GSE142277/GSM4224315_out_gene_exon_tagged.dge_exonssf002_WT.txt", sep = "\t", index_col = 0)
+
+# Default location of the marker gene set (revelio_gene_sets.csv)
+DEFAULT_GENE_SET_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "data", "revelio_gene_sets.csv"
+)
+
+# CSV uses dots in column names; map to the slash notation used everywhere else
+_CSV_PHASE_MAP = {"G1.S": "G1/S", "S": "S", "G2": "G2", "G2.M": "G2/M", "M.G1": "M/G1"}
 
 
-def _full_pipeline(adata, k):
-    """Run kNN → Laplacian Eigenmaps → angular pseudotime.
+def load_marker_dict(path=DEFAULT_GENE_SET_PATH):
+    """Load the 5-phase marker dictionary from revelio_gene_sets.csv.
 
-    Returns (pseudotime_array, eigenvalues).
+    Returns a dict mapping phase name (slash notation) -> list of gene symbols.
     """
-    csr = loadAndCSR(adata, k)
-    embedding, eigvals = laplacianEigenmaps(csr)
-    pt = pseudotime(embedding)
-    return pt, eigvals
+    df = pd.read_csv(path, index_col=0)
+    marker_dict = {}
+    for col in df.columns:
+        phase = _CSV_PHASE_MAP.get(col, col)
+        marker_dict[phase] = list(df[col].dropna().astype(str).str.strip().values)
+    return marker_dict
+
+
+def _full_pipeline(data, k):
+    """Run kNN → Laplacian Eigenmaps → pseudotime.
+
+    Returns (pseudotime_array, eigenvalues, adata, embedding).
+    """
+    adata = revelio_like_preprocess(data, marker_dict)
+    embedding, eigvals, ps = fullLaplacian(adata, k)
+    return ps, eigvals, adata, embedding
+def full_diffusion_pipeline(data, k):
+    adata = revelio_like_preprocess(data, marker_dict)
+    emb, lambdas, psis, dpt = fullDiffusion(adata, k)
+    return emb, lambdas, psis, dpt, adata
+
 
 
 # ── Circular statistics ──────────────────────────────────────────────────
-
+import numpy as np
+TWOPI = 2 * np. pi
+def wrap_angle(x):
+    return np.mod(x, TWOPI)
+def circ_mean (alpha) :
+    return np.arctan2(np.sin(alpha).sum(), np.cos(alpha).sum())
+def mean_cosine_agreement (thetal, theta2) :
+# both assumed already wrapped
+    return np.mean(np.cos(thetal - theta2))
 def circular_mean(angles):
     """Circular mean of angles in radians."""
     return np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
+def align_circular_pseudotime(theta_full, theta_sub, allow_reflection=True):
+    theta_full = wrap_angle(np.asarray (theta_full))
+    theta_sub = wrap_angle(np.asarray (theta_sub))
+    signs = [1, -1] if allow_reflection else [1]
+    best = None
+    for s in signs:
+        theta_trial = wrap_angle(s * theta_sub)
+        # optimal rotation = circular mean of angle differences
+        diffs = wrap_angle(theta_full - theta_trial)
+        delta = circ_mean (diffs)
+        aligned = wrap_angle(theta_trial + delta)
+        score = mean_cosine_agreement (theta_full, aligned)
+        candidate = {
+        "aligned": aligned,
+        "delta": delta,
+        "sign": 5,
+        "score": score,
+        }
+        if best is None or candidate ["score"] > best ["score"]:
+            best = candidate
+    return best
 
-
-def circular_corr(theta1, theta2):
-    """Circular–circular correlation coefficient (Jammalamadaka & SenGupta).
-
-    Invariant to rotation of either variable.  Returns value in [-1, 1].
-    """
-    mu1 = circular_mean(theta1)
-    mu2 = circular_mean(theta2)
-    sin1 = np.sin(theta1 - mu1)
-    sin2 = np.sin(theta2 - mu2)
-    denom = np.sqrt(np.sum(sin1 ** 2) * np.sum(sin2 ** 2))
-    if denom == 0:
+def aligned_circular_agreement(theta1, theta2):
+   
+    theta1 = np.asarray(theta1)
+    theta2 = np.asarray(theta2)
+    if len(theta1) == 0:
         return 0.0
-    return np.sum(sin1 * sin2) / denom
+    # Best forward rotation
+    alpha_fwd = np.arctan2(np.sum(np.sin(theta1 - theta2)),
+                           np.sum(np.cos(theta1 - theta2)))
+    fwd = np.mean(np.cos(theta1 - theta2 - alpha_fwd))
+    # Best reflected rotation (θ2 → -θ2)
+    alpha_rev = np.arctan2(np.sum(np.sin(theta1 + theta2)),
+                           np.sum(np.cos(theta1 + theta2)))
+    rev = np.mean(np.cos(theta1 + theta2 - alpha_rev))
+    return float(max(fwd, rev))
+def correlation_with_phase_scores(adata, pseudotime_values, marker_dict=None):
+    """Spearman correlation between pseudotime and each phase's z-score.
 
-
-# ── 1. Correlation with cell cycle phase scores ─────────────────────────
-
-def score_cell_cycle(adata):
-    """Add S_score, G2M_score, and phase columns to adata.obs.
-
-    Filters gene lists to those present in the dataset.
-    Modifies adata in-place and returns it.
-    """
-    s_present = [g for g in S_GENES if g in adata.var_names]
-    g2m_present = [g for g in G2M_GENES if g in adata.var_names]
-    print(f"S-phase genes found: {len(s_present)}/{len(S_GENES)}")
-    print(f"G2M genes found:     {len(g2m_present)}/{len(G2M_GENES)}")
-    sc.tl.score_genes_cell_cycle(adata, s_genes=s_present, g2m_genes=g2m_present)
-    return adata
-
-
-def correlation_with_phase_scores(adata, pseudotime_values):
-    """Spearman correlation between pseudotime and S_score / G2M_score.
-
-    Runs score_cell_cycle(adata) if scores are not yet present.
+    Runs score_cell_cycle(adata, marker_dict) if scores are not yet present.
 
     Returns
     -------
-    dict  {score_name: {'spearman_rho': float, 'p_value': float}}
+    dict  {phase_name: {'spearman_rho': float, 'p_value': float}}
     """
-    if "S_score" not in adata.obs.columns:
-        score_cell_cycle(adata)
+    phase_names = list(adata.obs["cc_phase"].cat.categories)
+    z = adata.obsm["phase_scores_z"]
 
     results = {}
-    for col in ["S_score", "G2M_score"]:
-        rho, pval = stats.spearmanr(pseudotime_values, adata.obs[col])
-        results[col] = {"spearman_rho": rho, "p_value": pval}
-        print(f"{col}: Spearman ρ = {rho:+.3f}, p = {pval:.2e}")
+    for j, ph in enumerate(phase_names):
+        rho, pval = stats.spearmanr(pseudotime_values, z[:, j])
+        results[ph] = {"spearman_rho": rho, "p_value": pval}
+        print(f"  {ph:5s}: Spearman ρ = {rho:+.3f}, p = {pval:.2e}")
     return results
 
 
 # ── 2. Phase order validation ───────────────────────────────────────────
 
-def validate_phase_order(adata, pseudotime_values):
-    """Check that G1 → S → G2M occurs in circular order along pseudotime.
+def validate_phase_order(adata, pseudotime_values, marker_dict=None):
+    """Check that G1/S → S → G2/M → M → M/G1 is the circular order along pseudotime.
 
-    Because the direction of traversal around the circle is arbitrary
-    (eigenvector sign), both G1→S→G2M and G1→G2M→S (reverse) are
-    considered biologically valid.
+    Because eigenvector sign is arbitrary, both forward and reverse traversal
+    around the circle are considered biologically valid.
 
     Returns
     -------
     phase_means : dict   {phase: circular_mean_pseudotime}
-    order_valid : bool   True if the three phases are in one of the two
-                         valid circular orderings
-    direction   : str    'forward' or 'reverse'
+    order_valid : bool   True if the phases appear in (forward or reverse)
+                         cyclic order
+    direction   : str    'forward', 'reverse', or None
     """
-    if "phase" not in adata.obs.columns:
-        score_cell_cycle(adata)
-
-    phases = adata.obs["phase"]
+    phases = adata.obs["cc_phase"]
     phase_means = {}
-    for phase in ["G1", "S", "G2M"]:
+    for phase in PHASE_ORDER:
         mask = (phases == phase).values
         n = mask.sum()
         if n == 0:
-            print(f"WARNING: no cells assigned to {phase}")
+            print(f"  WARNING: no cells assigned to {phase}")
             continue
         phase_means[phase] = circular_mean(pseudotime_values[mask])
-        print(f"  {phase:3s}: n = {n:4d}, circular mean = {phase_means[phase]:+.3f} rad")
+        print(f"  {phase:5s}: n = {n:4d}, circular mean = {phase_means[phase]:+.3f} rad")
 
-    if len(phase_means) < 3:
-        print("Cannot validate order — not all three phases represented.")
+    present_phases = [p for p in PHASE_ORDER if p in phase_means]
+    if len(present_phases) < 3:
+        print("Cannot validate order — fewer than 3 phases represented.")
         return phase_means, False, None
 
-    g1 = phase_means["G1"]
-    s = phase_means["S"]
-    g2m = phase_means["G2M"]
+    # Rotate all present phases so the first is at angle 0, check cyclic order
+    angles = np.array([phase_means[p] for p in present_phases])
+    rel = (angles - angles[0]) % (2 * np.pi)
 
-    # Normalize angles relative to G1 into [0, 2π)
-    s_rel = (s - g1) % (2 * np.pi)
-    g2m_rel = (g2m - g1) % (2 * np.pi)
+    is_forward = np.all(np.diff(rel) > 0)
+    # Reverse: angles decrease monotonically around the circle
+    rel_rev = (angles[0] - angles) % (2 * np.pi)
+    is_reverse = np.all(np.diff(rel_rev[1:]) > 0) if len(rel_rev) > 2 else True
+    # Simpler reverse check: reversed list is forward
+    rel_r = (angles[::-1] - angles[-1]) % (2 * np.pi)
+    is_reverse = np.all(np.diff(rel_r) > 0)
 
-    if s_rel < g2m_rel:
+    if is_forward:
         direction = "forward"
-    else:
+        order_valid = True
+    elif is_reverse:
         direction = "reverse"
+        order_valid = True
+    else:
+        direction = None
+        order_valid = False
 
-    # Both directions are biologically valid (just reflects eigenvector sign)
-    print(f"  Phase order: G1 → S → G2M ({direction} around circle)")
-    return phase_means, True, direction
+    arrow = " → ".join(present_phases)
+    if order_valid:
+        print(f"  Phase order: {arrow} ({direction} around circle)")
+    else:
+        print(f"  Phase order INVALID — observed angles do not match {arrow}")
+    return phase_means, order_valid, direction
 
 
 # ── 3. Robustness testing ───────────────────────────────────────────────
 
-def subsample_stability(adata, k=15, n_trials=10, frac=0.8, seed=42):
-    """Recompute pseudotime on random cell subsets; measure consistency.
-
-    For each trial, randomly samples *frac* of cells, reruns the full
-    pipeline, and computes circular correlation with the full-data
-    pseudotime (on shared cells).  Takes |correlation| to account for
-    arbitrary eigenvector sign flips.
+def generate_subsample_indices(n_cells, n_trials=10, frac=0.8, seed=42):
+    """Pre-generate shared subsample indices so Laplacian and diffusion
+    stability tests score the exact same cell subsets.
 
     Returns
     -------
-    list[float]  absolute circular correlation for each trial
+    list[np.ndarray]  sorted integer index arrays, one per trial
     """
-    n_cells = adata.n_obs
     n_sample = int(n_cells * frac)
     rng = np.random.default_rng(seed)
+    return [np.sort(rng.choice(n_cells, n_sample, replace=False))
+            for _ in range(n_trials)]
 
-    print(f"Computing full pseudotime (k={k}) ...")
-    pt_full, _ = _full_pipeline(adata, k)
+
+def subsample_stability(adata, embedding, k=4, n_trials=10, frac=0.8, seed=42,
+                         indices=None):
+    """Recompute angular pseudotime on random cell subsets; measure consistency.
+
+    For each trial, randomly samples *frac* of cells from the already-
+    preprocessed adata, rebuilds kNN → Laplacian Eigenmaps → angular
+    pseudotime, and computes aligned circular agreement (rotation- and
+    reflection-invariant) with the full-data angular pseudotime.  The
+    reflection invariance handles arbitrary eigenvector sign flips.
+
+    Parameters
+    ----------
+    adata     : AnnData after revelio_like_preprocess (has X_pca, cc_phase)
+    embedding : (n_cells, 2) full-data Laplacian embedding
+    k         : kNN k for graph construction
+    n_trials  : number of subsampling rounds
+    frac      : fraction of cells to keep per trial
+    seed      : random seed
+
+    Returns
+    -------
+    correlations : list[float]  aligned circular agreement for each trial
+    trial_data   : list[dict]   per-trial info (indices, subsampled pseudotime)
+    """
+    from trajectory_inference.Laplacian_Eigenmaps import loadAndCSR, laplacianEigenmaps
+
+    n_cells = adata.n_obs
+    if indices is None:
+        indices = generate_subsample_indices(n_cells, n_trials, frac, seed)
+    n_trials = len(indices)
+    n_sample = len(indices[0])
+
+    # Full-data angular pseudotime as reference
+    ang_pt_full = angular_pseudotime(embedding, adata)
+
+    print(f"  Full data: {n_cells} cells, subsampling {n_sample} ({n_sample/n_cells:.0%}), k={k}")
 
     correlations = []
-    for t in range(n_trials):
-        idx = np.sort(rng.choice(n_cells, n_sample, replace=False))
+    trial_data = []
+    for t, idx in enumerate(indices):
         adata_sub = adata[idx].copy()
 
-        print(f"  Trial {t + 1}/{n_trials} ({n_sample} cells) ... ", end="")
-        pt_sub, _ = _full_pipeline(adata_sub, k)
+        # Rebuild kNN → Laplacian → embedding on subsampled cells
+        csr_sub = loadAndCSR(adata_sub, k)
+        emb_sub, eigvals_sub = laplacianEigenmaps(csr_sub)
+        ang_pt_sub = angular_pseudotime(emb_sub, adata_sub)
 
-        corr = abs(circular_corr(pt_full[idx], pt_sub))
+        corr = aligned_circular_agreement(ang_pt_full[idx], ang_pt_sub)
         correlations.append(corr)
-        print(f"|circular corr| = {corr:.3f}")
+
+        # Per-phase pseudotime agreement and circular medians
+        phases_sub = adata.obs["cc_phase"].values[idx]
+        phase_corrs = {}
+        phase_medians = {}
+        for ph in PHASE_ORDER:
+            mask = phases_sub == ph
+            if mask.sum() < 3:
+                phase_corrs[ph] = np.nan
+                phase_medians[ph] = np.nan
+            else:
+                phase_corrs[ph] = aligned_circular_agreement(
+                    ang_pt_full[idx][mask], ang_pt_sub[mask])
+                phase_medians[ph] = circular_mean(ang_pt_sub[mask])
+
+        trial_data.append({"idx": idx, "ang_pt_sub": ang_pt_sub,
+                           "ang_pt_full": ang_pt_full[idx],
+                           "phases": phases_sub, "phase_corrs": phase_corrs,
+                           "phase_medians": phase_medians})
+        print(f"  Trial {t + 1}/{n_trials}: aligned agreement = {corr:.3f}")
 
     mean_c = np.mean(correlations)
     std_c = np.std(correlations)
-    print(f"Subsample stability: {mean_c:.3f} ± {std_c:.3f}")
-    return correlations
+    print(f"\n  Subsample stability: {mean_c:.3f} +/- {std_c:.3f}")
+    return correlations, trial_data
 
 
-def k_stability(adata, k_values=None):
-    """Compute pseudotime for a range of k values and compare pairwise.
+def subsample_stability_diffusion(adata, embedding, k=8, n_trials=10, frac=0.8,
+                                  seed=42, indices=None):
+    """Recompute diffusion-maps pseudotime on random cell subsets; measure
+    consistency with the full-data result.
+
+    Mirrors subsample_stability() but uses diffusion_maps.fullDiffusion
+    instead of the Laplacian-Eigenmaps pipeline. Stores each subsample's
+    dpt on adata_sub.obs["pseudotime"] so angular_pseudotime() picks it up.
 
     Returns
     -------
-    pseudotimes : dict   {k: pseudotime_array}
-    corr_matrix : np.ndarray  (n_k, n_k) pairwise |circular correlation|
+    correlations : list[float]  aligned circular agreement per trial
+    trial_data   : list[dict]   same schema as subsample_stability, so
+                                plot_aggregate_hexbin and
+                                plot_correlation_by_phase work as-is.
+    """
+    from trajectory_inference.diffusion_maps import fullDiffusion
+
+    # Full-data diffusion: convert to angular via arctan2 on first 2 diffusion
+    # coords so full and sub are on the same [0, 2π) scale.
+    emb_full, _, _, dpt_full = fullDiffusion(adata, k)
+    ang_pt_full = angular_pseudotime(emb_full, adata)
+
+    n_cells = adata.n_obs
+    if indices is None:
+        indices = generate_subsample_indices(n_cells, n_trials, frac, seed)
+    n_trials = len(indices)
+    n_sample = len(indices[0])
+
+    print(f"  Full data: {n_cells} cells, subsampling {n_sample} ({n_sample/n_cells:.0%}), k={k}")
+
+    correlations = []
+    trial_data = []
+    for t, idx in enumerate(indices):
+        adata_sub = adata[idx].copy()
+        emb_sub, _, _, dpt_sub = fullDiffusion(adata_sub, k)
+        ang_pt_sub = angular_pseudotime(emb_sub, adata_sub)
+        corr = aligned_circular_agreement(ang_pt_full[idx], ang_pt_sub)
+        correlations.append(corr)
+
+        phases_sub = adata.obs["cc_phase"].values[idx]
+        phase_corrs = {}
+        phase_medians = {}
+        for ph in PHASE_ORDER:
+            mask = phases_sub == ph
+            if mask.sum() < 3:
+                phase_corrs[ph] = np.nan
+                phase_medians[ph] = np.nan
+            else:
+                phase_corrs[ph] = aligned_circular_agreement(
+                    ang_pt_full[idx][mask], ang_pt_sub[mask])
+                phase_medians[ph] = circular_mean(ang_pt_sub[mask])
+
+        trial_data.append({"idx": idx, "ang_pt_sub": ang_pt_sub,
+                           "ang_pt_full": ang_pt_full[idx],
+                           "phases": phases_sub, "phase_corrs": phase_corrs,
+                           "phase_medians": phase_medians})
+        print(f"  Trial {t + 1}/{n_trials}: aligned agreement = {corr:.3f}")
+
+    mean_c = np.mean(correlations)
+    std_c = np.std(correlations)
+    print(f"\n  Subsample stability (diffusion): {mean_c:.3f} +/- {std_c:.3f}")
+    return correlations, trial_data
+
+
+def k_stability(raw_counts_df, marker_dict, k_values=None):
+    """Compute angular pseudotime for a range of k values and compare pairwise.
+
+    Runs the full pipeline (preprocess → kNN → Laplacian → angular pseudotime)
+    for each k value.
+
+    Returns
+    -------
+    pseudotimes : dict   {k: angular_pseudotime_array}
+    corr_matrix : np.ndarray  (n_k, n_k) pairwise aligned circular agreement
     """
     if k_values is None:
-        k_values = [10, 15, 20, 25, 30, 35, 40, 45, 50]
+        k_values = [4, 6, 8, 10, 15, 20]
 
     pseudotimes = {}
     eigval_ratios = {}
     for k in k_values:
         print(f"  k = {k} ... ", end="")
-        pt, eigvals = _full_pipeline(adata, k)
-        pseudotimes[k] = pt
+        ps, eigvals, adata_k, emb_k = _full_pipeline(raw_counts_df, k)
+        ang_pt = angular_pseudotime(emb_k, adata_k)
+        pseudotimes[k] = ang_pt
         ratio = eigvals[1] / eigvals[0] if eigvals[0] != 0 else float("inf")
         eigval_ratios[k] = ratio
-        print(f"eigenvalue ratio λ2/λ1 = {ratio:.2f}")
+        print(f"eigenvalue ratio lambda2/lambda1 = {ratio:.2f}")
 
-    # Pairwise circular correlations
+    # Pairwise aligned circular agreement
     n_k = len(k_values)
     corr_matrix = np.ones((n_k, n_k))
     for i in range(n_k):
         for j in range(i + 1, n_k):
-            c = abs(circular_corr(pseudotimes[k_values[i]], pseudotimes[k_values[j]]))
+            c = aligned_circular_agreement(
+                pseudotimes[k_values[i]], pseudotimes[k_values[j]])
             corr_matrix[i, j] = c
             corr_matrix[j, i] = c
 
-    # Print correlation matrix
-    print("\nPairwise |circular correlation| across k values:")
+    # Print agreement matrix
+    print("\nPairwise aligned circular agreement across k values:")
     header = "      " + "  ".join(f"k={k:<2d}" for k in k_values)
     print(header)
     for i, k in enumerate(k_values):
@@ -246,42 +442,307 @@ def k_stability(adata, k_values=None):
 
     return pseudotimes, corr_matrix
 
+# ── Angular pseudotime for circular validation ─────────────────────────
+
+def angular_pseudotime(embedding, adata):
+    """Compute angular pseudotime (0 to 2π) from the 2D Laplacian embedding.
+
+    Uses arctan2 to place each cell on the circle, then shifts so the
+    most confident G1/S cell is at 0 and values increase through the cycle.
+    """
+    angles = np.arctan2(embedding[:, 1], embedding[:, 0])
+
+    # Find root: most confident G1/S cell, extremal on embedding axis 0
+    cand = (adata.obs["cc_phase"] == "G1/S").values
+    cand &= (adata.obs["best_val"] > 1.0).values
+    cand &= (adata.obs["phase_margin"] > 0.75).values
+    if cand.sum() == 0:
+        cand = (adata.obs["cc_phase"] == "G1/S").values
+    root = int(np.where(cand)[0][np.argmin(embedding[cand, 0])])
+
+    # Shift so root is at 0, wrap to [0, 2π)
+    angular_pt = (angles - angles[root]) % (2 * np.pi)
+    return angular_pt
+
+
+
+def plot_phase_zscore_heatmap(adata, embedding):
+    """Heatmap of CSV phase z-scores with cells sorted by angular pseudotime.
+
+    Requires score_with_csv_geneset() to have been called first so that
+    obsm['phase_scores_z_v2'] and obs['cc_phase_v2'] exist in adata.
+    """
+    ang_pt = angular_pseudotime(embedding, adata)
+    order = np.argsort(ang_pt)
+
+    z = adata.obsm["phase_scores_z_v2"]
+    phase_names = list(adata.obs["cc_phase_v2"].cat.categories)
+
+    # Cells as columns (sorted by pseudotime), phases as rows
+    z_sorted = z[order, :].T  # (5 phases, n_cells)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 4), dpi=150,
+                             gridspec_kw={"height_ratios": [1, 0.08]},
+                             sharex=True)
+
+    # Main heatmap
+    ax = axes[0]
+    im = ax.imshow(z_sorted, aspect="auto", cmap="RdBu_r",
+                   vmin=-2, vmax=2, interpolation="none")
+    ax.set_yticks(range(len(phase_names)))
+    ax.set_yticklabels(phase_names, fontsize=9)
+    ax.set_ylabel("Phase z-score")
+    ax.set_title("Phase z-scores along angular pseudotime (CSV gene set)")
+    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.01, label="z-score")
+
+    # Phase color bar underneath
+    ax2 = axes[1]
+    phase_labels = adata.obs["cc_phase_v2"].values[order]
+    phase_to_int = {ph: i for i, ph in enumerate(phase_names)}
+    phase_ints = np.array([phase_to_int[p] for p in phase_labels])[None, :]
+    cmap_phases = plt.cm.get_cmap("tab10", len(phase_names))
+    ax2.imshow(phase_ints, aspect="auto", cmap=cmap_phases,
+               vmin=-0.5, vmax=len(phase_names) - 0.5, interpolation="none")
+    ax2.set_yticks([0])
+    ax2.set_yticklabels(["Phase"], fontsize=9)
+    ax2.set_xlabel("Cells (sorted by angular pseudotime)")
+
+    # Legend for phase colors
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=cmap_phases(i), label=ph)
+               for i, ph in enumerate(phase_names)]
+    ax2.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.5),
+               fontsize=7, frameon=False)
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+# ── Subsample robustness plots ───────────────────────────────────────────
+
+
+def plot_aggregate_hexbin(trial_data, save_path="subsample_hexbin.jpg",
+                          correlations=None, method_name=None):
+    """Hexbin of full vs subsampled pseudotime, aggregated across all
+    phases and all trials. When ``correlations`` (per-trial aligned
+    agreement) is provided, the title reports overall stability as
+    mean +/- std.
+    """
+    pt_full_all, pt_sub_all = [], []
+    for td in trial_data:
+        pt_full = np.asarray(td["ang_pt_full"])
+        pt_sub = np.asarray(td["ang_pt_sub"])
+        best = align_circular_pseudotime(pt_full, pt_sub, allow_reflection=True)
+        pt_full_all.append(pt_full)
+        pt_sub_all.append(best["aligned"])
+    pt_full_all = np.concatenate(pt_full_all)
+    pt_sub_all = np.concatenate(pt_sub_all)
+    lo = float(min(pt_full_all.min(), pt_sub_all.min()))
+    hi = float(max(pt_full_all.max(), pt_sub_all.max()))
+    pad = 0.02 * (hi - lo) if hi > lo else 1.0
+    lo, hi = lo - pad, hi + pad
+
+    fig, ax = plt.subplots(figsize=(5, 5), dpi=150)
+    hb = ax.hexbin(pt_full_all, pt_sub_all, gridsize=40, cmap="Blues",
+                   mincnt=1, extent=(lo, hi, lo, hi))
+    fig.colorbar(hb, ax=ax, label="count")
+    ax.plot([lo, hi], [lo, hi], "k--", linewidth=0.8, alpha=0.5)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Full pseudotime")
+    ax.set_ylabel("Subsampled pseudotime")
+
+    if correlations is not None and len(correlations) > 0:
+        mean_c = float(np.mean(correlations))
+        std_c = float(np.std(correlations))
+        title = f"Subsample Stability {mean_c:.3f} +/- {std_c:.3f}"
+    else:
+        title = "Full vs subsampled pseudotime"
+    ax.set_title(title)
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved {save_path}")
+    plt.show()
+
+
+def plot_correlation_by_phase(trial_data, save_path="subsample_correlation_by_phase.jpg"):
+    """Per-phase dot plot of aligned circular agreement: one point per trial,
+    phases on the x-axis, red bar at the mean.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4), dpi=150)
+    rng = np.random.default_rng(42)
+    for i, ph in enumerate(PHASE_ORDER):
+        vals = [td["phase_corrs"].get(ph, np.nan) for td in trial_data]
+        vals = [v for v in vals if not np.isnan(v)]
+        jitter = i + 0.1 * rng.standard_normal(len(vals))
+        ax.scatter(jitter, vals, s=30, alpha=0.6, color="steelblue",
+                   edgecolors="white", linewidths=0.4, zorder=3)
+        if vals:
+            ax.hlines(np.mean(vals), i - 0.25, i + 0.25,
+                      colors="firebrick", linewidth=1.5, zorder=4)
+    ax.set_xticks(range(len(PHASE_ORDER)))
+    ax.set_xticklabels(PHASE_ORDER)
+    ax.set_ylim(0, 1.05)
+    ax.set_xlabel("Phase")
+    ax.set_ylabel("Aligned circular agreement")
+    ax.set_title(f"Per-phase subsample agreement ({len(trial_data)} trials)")
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved {save_path}")
+    plt.show()
+
+
+def plot_phase_order(adata, embedding, phase_means, direction=None,
+                     save_path="phase_order.jpg"):
+    """Polar plot of phase-order validation results.
+
+    - Cells plotted at their angular pseudotime with radial jitter, colored
+      by assigned phase (shows how tight each phase cluster is).
+    - Large black-edged marker at each phase's circular mean.
+    - Arrows connect successive phases in PHASE_ORDER along the short arc,
+      so a valid cycle shows a clean traversal around the circle.
+    """
+    ang_pt = angular_pseudotime(embedding, adata)
+    cmap = plt.cm.get_cmap("tab10", len(PHASE_ORDER))
+    colors = {ph: cmap(i) for i, ph in enumerate(PHASE_ORDER)}
+
+    fig, ax = plt.subplots(subplot_kw={"projection": "polar"},
+                           figsize=(7, 7), dpi=150)
+
+    rng = np.random.default_rng(42)
+    for ph in PHASE_ORDER:
+        mask = (adata.obs["cc_phase"] == ph).values
+        if mask.sum() == 0:
+            continue
+        r = 1.0 + 0.12 * rng.standard_normal(mask.sum())
+        ax.scatter(ang_pt[mask], r, s=8, alpha=0.35,
+                   color=colors[ph], edgecolors="none", label=ph)
+
+    present = [p for p in PHASE_ORDER if p in phase_means]
+    R_MEAN = 1.55
+    for ph in present:
+        th = phase_means[ph] % (2 * np.pi)
+        ax.scatter(th, R_MEAN, s=280, color=colors[ph],
+                   edgecolors="black", linewidths=1.5, zorder=5)
+        ax.text(th, R_MEAN + 0.3, ph, ha="center", va="center",
+                fontsize=11, fontweight="bold")
+
+    # Arrows between successive phase means along the short arc
+    cycle = present + present[:1]
+    for a, b in zip(cycle[:-1], cycle[1:]):
+        t1 = phase_means[a] % (2 * np.pi)
+        t2 = phase_means[b] % (2 * np.pi)
+        diff_ccw = (t2 - t1) % (2 * np.pi)
+        diff_cw = (t1 - t2) % (2 * np.pi)
+        if diff_ccw <= diff_cw:
+            arc = np.linspace(t1, t1 + diff_ccw, 40)
+        else:
+            arc = np.linspace(t1, t1 - diff_cw, 40)
+        ax.plot(arc, np.full_like(arc, R_MEAN), "-",
+                color="gray", lw=1.5, alpha=0.6, zorder=3)
+        ax.annotate("", xy=(arc[-1], R_MEAN), xytext=(arc[-2], R_MEAN),
+                    arrowprops=dict(arrowstyle="->", color="gray",
+                                    lw=1.5, alpha=0.8))
+
+    ax.set_rticks([])
+    ax.set_rlim(0, 2.1)
+    title = "Phase Order Validation along Angular Pseudotime"
+    ax.set_title(title, pad=25, fontsize=13)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.12, 1.0),
+              fontsize=9, frameon=False, markerscale=1.5)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved {save_path}")
+    plt.show()
+
 
 # ── Run all validations ─────────────────────────────────────────────────
 
-def run_all(adata, pseudotime_values, k=15, subsample_trials=10, k_values=None):
-    """Run all three validation axes and return combined results.
+def run_all(adata, embedding, raw_counts_df, marker_dict, k,
+            subsample_trials=10, k_values=None, subsample_indices=None):
+    """Run all validation axes and return combined results.
 
     Parameters
     ----------
-    adata             : AnnData with X_pca in .obsm
-    pseudotime_values : array of angular pseudotime (from Laplacian Eigenmaps)
-    k                 : k used to produce pseudotime_values (for subsampling)
+    adata             : AnnData after revelio_like_preprocess
+    embedding         : (n_cells, 2) Laplacian embedding
+    raw_counts_df     : genes-by-cells raw counts DataFrame
+    marker_dict       : dict mapping phase name -> list of marker genes
+    k                 : k used to produce the embedding (for subsampling)
     subsample_trials  : number of subsampling rounds
     k_values          : list of k values for stability test (None = default range)
     """
-    print("=" * 60)
-    print("1. CORRELATION WITH CELL CYCLE PHASE SCORES")
-    print("=" * 60)
-    corr_results = correlation_with_phase_scores(adata, pseudotime_values)
+    ang_pt = angular_pseudotime(embedding, adata)
 
     print()
     print("=" * 60)
     print("2. PHASE ORDER VALIDATION")
     print("=" * 60)
-    phase_means, order_valid, direction = validate_phase_order(adata, pseudotime_values)
+    phase_means, order_valid, direction = validate_phase_order(adata, ang_pt)
 
     print()
     print("=" * 60)
     print("3a. SUBSAMPLE STABILITY")
     print("=" * 60)
-    sub_corrs = subsample_stability(adata, k=k, n_trials=subsample_trials)
+    sub_corrs, trial_data = subsample_stability(
+        adata, embedding, k=k, n_trials=subsample_trials,
+        indices=subsample_indices)
+
+    # print()
+    # print("=" * 60)
+    # print("3b. k-VALUE STABILITY")
+    # print("=" * 60)
+    # pt_dict, k_corr = k_stability(raw_counts_df, marker_dict, k_values=k_values)
+
+    return {
+        "phase_means": phase_means,
+        "phase_order_valid": order_valid,
+        "phase_direction": direction,
+        "subsample_correlations": sub_corrs,
+        "subsample_trial_data": trial_data
+        # "k_pseudotimes": pt_dict,
+        # "k_correlation_matrix": k_corr
+    }
+
+
+def run_all_diffusion(adata, embedding,  k=8, subsample_trials=10,
+                      subsample_indices=None):
+    """Run full diffusion-maps validation: phase score correlations,
+    phase order, and subsample robustness.
+
+    Assumes adata already has obs["pseudotime"] set (from fullDiffusion's
+    dpt) so angular_pseudotime(adata) can read it.
+
+    Returns a dict with the same top-level keys as run_all (minus the k-value
+    stability fields) so the existing plot helpers work unchanged.
+    """
+    ang_pt = angular_pseudotime(embedding, adata)
 
     print()
     print("=" * 60)
-    print("3b. k-VALUE STABILITY")
+    print("DIFFUSION: 1. PHASE SCORE CORRELATIONS")
     print("=" * 60)
-    pt_dict, k_corr = k_stability(adata, k_values=k_values)
+    corr_results = correlation_with_phase_scores(adata, ang_pt)
+
+    print()
+    print("=" * 60)
+    print("DIFFUSION: 2. PHASE ORDER VALIDATION")
+    print("=" * 60)
+    phase_means, order_valid, direction = validate_phase_order(adata, ang_pt)
+
+    print()
+    print("=" * 60)
+    print("DIFFUSION: 3. SUBSAMPLE STABILITY")
+    print("=" * 60)
+    sub_corrs, trial_data = subsample_stability_diffusion(
+        adata, embedding, k=k, n_trials=subsample_trials,
+        indices=subsample_indices)
 
     return {
         "phase_score_correlations": corr_results,
@@ -289,14 +750,69 @@ def run_all(adata, pseudotime_values, k=15, subsample_trials=10, k_values=None):
         "phase_order_valid": order_valid,
         "phase_direction": direction,
         "subsample_correlations": sub_corrs,
-        "k_pseudotimes": pt_dict,
-        "k_correlation_matrix": k_corr,
+        "subsample_trial_data": trial_data,
     }
 
 
 if __name__ == "__main__":
-    from data.preprocess.preprocess import adata
+    marker_dict = load_marker_dict()
+    k = 4
+    n_trials = 10
 
-    k = 15
-    pt, _ = _full_pipeline(adata, k)
-    run_all(adata, pt, k=k)
+    # ── Laplacian Eigenmaps full validation ──────────────────────────
+    print("\n" + "#" * 60)
+    print("# LAPLACIAN EIGENMAPS PIPELINE")
+    print("#" * 60)
+    ps_lap, eigvals_lap, adata_lap, emb_lap = _full_pipeline(data, k)
+
+    print("=" * 60)
+    print("1. PHASE SCORE CORRELATIONS (Laplacian)")
+    print("=" * 60)
+    ang_pt_lap = angular_pseudotime(emb_lap, adata_lap)
+    correlation_with_phase_scores(adata_lap, ang_pt_lap)
+
+    # Shared subsample indices so Laplacian and diffusion evaluate the
+    # exact same cell subsets. Preprocessing is deterministic, so both
+    # pipelines yield adata with the same n_obs.
+    shared_idx = generate_subsample_indices(adata_lap.n_obs, n_trials=n_trials)
+
+    lap_results = run_all(adata_lap, emb_lap, data, marker_dict, k=k,
+                          subsample_trials=n_trials,
+                          subsample_indices=shared_idx)
+    plot_aggregate_hexbin(
+        lap_results["subsample_trial_data"],
+        save_path="subsample_hexbin_laplacian.jpg",
+        correlations=lap_results["subsample_correlations"],
+        method_name="Laplacian Eigenmaps")
+    plot_correlation_by_phase(
+        lap_results["subsample_trial_data"],
+        save_path="subsample_correlation_by_phase_laplacian.jpg")
+    plot_phase_order(
+        adata_lap, emb_lap,
+        lap_results["phase_means"],
+        lap_results["phase_direction"],
+        save_path="phase_order_laplacian.jpg")
+
+    # ── Diffusion-maps full validation ───────────────────────────────
+    print("\n" + "#" * 60)
+    print("# DIFFUSION MAPS PIPELINE")
+    print("#" * 60)
+    emb_diff, lambdas, psis, dpt, adata_diff = full_diffusion_pipeline(data, k)
+    assert adata_diff.n_obs == adata_lap.n_obs, \
+        "adata mismatch — shared indices would be invalid"
+    diff_results = run_all_diffusion(adata_diff, emb_diff, k=k,
+                                     subsample_trials=n_trials,
+                                     subsample_indices=shared_idx)
+    plot_aggregate_hexbin(
+        diff_results["subsample_trial_data"],
+        save_path="subsample_hexbin_diffusion.jpg",
+        correlations=diff_results["subsample_correlations"],
+        method_name="Diffusion Maps")
+    plot_correlation_by_phase(
+        diff_results["subsample_trial_data"],
+        save_path="subsample_correlation_by_phase_diffusion.jpg")
+    plot_phase_order(
+        adata_diff, emb_diff,
+        diff_results["phase_means"],
+        diff_results["phase_direction"],
+        save_path="phase_order_diffusion.jpg")
