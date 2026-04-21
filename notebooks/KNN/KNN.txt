@@ -1,0 +1,15 @@
+1. load preprocessed data
+2. preform KNN to find k nearest neighbors for every cell by
+measuring Euclidean distanct to all other cells in PCA(keeps 20 closest)
+3. Build adaptive kernel weights, compute a kernel weight that reflects how 
+similar cells are, the adaptive kernal changes in dense and sparse regions
+4. Converts the 1029x1029 matrix into a compressed sparse row form
+5. Density normalization will divide out the local density so the diffusion map will reflect
+so the true structure of the manifold is shown and not biased to denser regions
+6. Build the markov-matrix, row normalize so all rows sum to 1
+7. to make eigen decomposition stable the matrix has to become symettric through a symmetric conjugate
+8. Eigen-decomposition finds the top eigenvectors 
+9. diffusion coordinates scales each eigenvector by its eigenvalue
+raised to diffusion time, eigenvectors with large eigenvalues are emphasized
+- these will be the main trajectory structure
+- fast decaying directions get supressed
