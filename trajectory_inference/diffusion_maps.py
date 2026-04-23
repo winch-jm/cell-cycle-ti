@@ -96,7 +96,7 @@ def kTilde(K, alpha=1.0, eps=1e-12):
 #     return K_tilde
 
 #### getting embedding from ktilde
-def diffusion_map_from_Ktilde(K_tilde, n_components=30, t=1, eps=1e-12):
+def diffusion_map_from_Ktilde(K_tilde, n_components=30, t=1, eps=1e-12,drop_trivial=True):
     """
     K_tilde: symmetric sparse matrix after alpha-normalization, before row-normalization
 
@@ -130,8 +130,11 @@ def diffusion_map_from_Ktilde(K_tilde, n_components=30, t=1, eps=1e-12):
     vecs = vecs[:, order]
 
     # drop trivial first eigenpair
-    lambdas = vals[1:n_components + 1]
-    u = vecs[:, 1:n_components + 1]
+    start_id = 0
+    if drop_trivial:
+        start_id = 1
+    lambdas = vals[start_id:n_components + 1]
+    u = vecs[:, start_id:n_components + 1]
 
     # right eigenvectors of P
     psis = u * inv_sqrt_d[:, None]

@@ -159,6 +159,7 @@ def aligned_circular_agreement(theta1, theta2):
                            np.sum(np.cos(theta1 + theta2)))
     rev = np.mean(np.cos(theta1 + theta2 - alpha_rev))
     return float(max(fwd, rev))
+    
 def correlation_with_phase_scores(adata, pseudotime_values, marker_dict=None):
     """Spearman correlation between pseudotime and each phase's z-score.
 

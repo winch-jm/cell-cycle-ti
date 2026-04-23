@@ -20,7 +20,7 @@ from data_structure.weighted_knn import DenseRows, weighted_knn
 from data.preprocess.preprocess import revelio_like_preprocess, loadData, readMarkerSets
 
 ####### preprocessed data loading and kNN
-def loadAndCSR(adata, k):
+def loadAndCSR(adata, k, weighting='adaptive_gaussian'):
 
     """Input -- AnnData object from data preprocessing
 
@@ -33,7 +33,7 @@ def loadAndCSR(adata, k):
     pca = adata.obsm["X_pca"]
     n, d = pca.shape
     dr = DenseRows(n = n, d = d, data = pca.flatten())
-    customCSR = weighted_knn(dr, k = k, metric='euclidean')
+    customCSR = weighted_knn(dr, k = k, metric='euclidean',weighting=weighting)
 
     # converting custom CSR to scipy sparse CSR
     CSR = sp.csr_matrix((customCSR.data, customCSR.indices, customCSR.indptr),shape=(n, n))
@@ -41,7 +41,7 @@ def loadAndCSR(adata, k):
     return CSR
 
 #### laplacian computation
-def laplacianEigenmaps(CSR, nComponents = 10,zero_tol=1e-10):
+def laplacianEigenmaps(CSR, nComponents = 10,zero_tol=1e-10, drop_trivial=True):
     """Input Parameters:
     CSR: compressed sparse row matrix of cell-cell similarity graph
     nComponents: number of embedding dimensions = 2 to get 2D embedding coordinates per cell required for circular pseudotime calculation
@@ -66,17 +66,20 @@ def laplacianEigenmaps(CSR, nComponents = 10,zero_tol=1e-10):
     v0 = rng.random(L.shape[0])
     # requesting "SM" for smallest eigvas/vecs and k = 3 to get smallest 2 non-trivial outputs (smallest eigval will be trivial = 0)
     eigvals, eigvecs = eigsh(L, k = nComponents + 1, M = D, which = "SM", tol = 1e-6, v0=v0)
-
+    
     # sorting eigenvalues in ascending order
     ordered = np.argsort(eigvals)
     eigvals = eigvals[ordered]
     eigvecs = eigvecs[:,ordered]
 
     # dropping trivial eigenvector
-    nontrivial = eigvals > zero_tol
-    eigvals = eigvals[nontrivial][1:]
-    embedding = eigvecs[:,nontrivial][:, 1:]
-
+    if drop_trivial:
+        nontrivial = eigvals > zero_tol
+        eigvals = eigvals[nontrivial][:nComponents]
+        embedding = eigvecs[:,nontrivial][:, :nComponents]
+    else:
+        eigvals = eigvals[:nComponents]
+        embedding = eigvecs[:nComponents]
 
     return embedding, eigvals
 
