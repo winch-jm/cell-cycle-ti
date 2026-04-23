@@ -33,7 +33,7 @@ def loadAndCSR(adata, k):
     pca = adata.obsm["X_pca"]
     n, d = pca.shape
     dr = DenseRows(n = n, d = d, data = pca.flatten())
-    customCSR = weighted_knn(dr, k = k)
+    customCSR = weighted_knn(dr, k = k, metric='euclidean')
 
     # converting custom CSR to scipy sparse CSR
     CSR = sp.csr_matrix((customCSR.data, customCSR.indices, customCSR.indptr),shape=(n, n))
@@ -41,7 +41,7 @@ def loadAndCSR(adata, k):
     return CSR
 
 #### laplacian computation
-def laplacianEigenmaps(CSR, nComponents = 10):
+def laplacianEigenmaps(CSR, nComponents = 10,zero_tol=1e-10):
     """Input Parameters:
     CSR: compressed sparse row matrix of cell-cell similarity graph
     nComponents: number of embedding dimensions = 2 to get 2D embedding coordinates per cell required for circular pseudotime calculation
@@ -73,8 +73,10 @@ def laplacianEigenmaps(CSR, nComponents = 10):
     eigvecs = eigvecs[:,ordered]
 
     # dropping trivial eigenvector
-    embedding = eigvecs[:, 1:]
-    eigvals = eigvals[1:]
+    nontrivial = eigvals > zero_tol
+    eigvals = eigvals[nontrivial][1:]
+    embedding = eigvecs[:,nontrivial][:, 1:]
+
 
     return embedding, eigvals
 
