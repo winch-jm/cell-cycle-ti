@@ -85,7 +85,7 @@ def __main__():
                     adata.obs['k'] = k
                     adata.obsm['X_pca'] = adata.X
 
-                    csr = loadAndCSR(adata, k=k)
+                    csr = loadAndCSR(adata, k=k, weighting='raw')
                     lap, eigvals = laplacianEigenmaps(csr, nComponents=5)
 
                     kT = kTilde(csr,alpha=0.5)
@@ -116,7 +116,7 @@ def __main__():
     results = pd.concat(result_list)
 
     # adata.write_h5ad('../data/toy_datasets/density_noise_exp.h5ad')
-    results.to_csv('../data/toy_datasets/density_noise_exp_metrics.csv')
+    results.to_csv('../data/toy_datasets/density_noise_exp_metrics_nogaussiankernel.csv')
 
 if __name__ == '__main__':
     __main__()
