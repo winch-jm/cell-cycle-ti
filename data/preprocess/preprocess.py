@@ -57,7 +57,7 @@ def revelio_like_preprocess(
     counts_df,
     marker_dict,
     min_cells_per_gene=5,
-    min_genes_per_cell=1200,
+    min_genes_per_cell=500,
     max_umi_per_cell=10**7,
     min_phase_top_z=1.0,
     min_phase_margin=0,
@@ -158,10 +158,39 @@ def revelio_like_preprocess(
     adata.obsm["phase_scores"] = phase_scores.values
     adata.obsm["phase_scores_z"] = phase_scores_z.values
 
+    # # ----------------------------
+    # # 5b) Neighboring-phase conflict / putative doublet filter
+    # # ----------------------------
+    # n_phases = len(phase_names)
+
+    # # circular distance between best and second-best phase indices
+    # phase_dist = np.abs(best_idx - second_idx)
+    # phase_dist = np.minimum(phase_dist, n_phases - phase_dist)
+
+    # # neighboring phases have circular distance 1
+    # # same phase cannot happen because second-best is forced to another column
+    # is_neighboring_phase = phase_dist == 1
+
+    # # conflict = top two scores correspond to non-neighboring phases
+    # # optionally require the second score to be meaningfully high
+    # conflict_doublet = (~is_neighboring_phase) & (second_val > 0)
+
+    # adata.obs["second_phase"] = pd.Categorical(
+    #     [phase_names[i] for i in second_idx],
+    #     categories=phase_names,
+    #     ordered=True
+    # )
+    # adata.obs["phase_dist"] = phase_dist
+    # adata.obs["phase_conflict_doublet"] = conflict_doublet
+
     # ----------------------------
     # 6) Filter to confident cycling cells
     # ----------------------------
-    keep = (adata.obs["best_val"] > min_phase_top_z) & (adata.obs["phase_margin"] > min_phase_margin)
+    keep = (
+            (adata.obs["best_val"] > min_phase_top_z)
+            & (adata.obs["phase_margin"] > min_phase_margin)
+            # & (~adata.obs["phase_conflict_doublet"])
+            )
     adata = adata[keep].copy()
 
     # ----------------------------
